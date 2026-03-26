@@ -1,0 +1,861 @@
+import asyncio
+import logging
+import random
+import sqlite3
+from datetime import datetime
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LabeledPrice,
+    Message,
+    PreCheckoutQuery,
+)
+
+from flyerapi import Flyer
+
+
+# =========================
+# CONFIG
+# =========================
+BOT_TOKEN = "8611016897:AAFKzH00dhqGzluHWeyj8m8W2RpTRlorDgo"
+FLYER_KEY = ""
+
+OWNER_ADMIN_ID = 1426171031
+
+GIFTS = {
+    "новогодний мишка": 5956217000635139069,
+    "ёлка": 5922558454332916696,
+    "мишка с сердцем": 5800655655995968830,
+    "сердце": 5801108895304779062,
+    "розовый мишка": 5866352046986232958,
+    "мишка клевер": 5893356958802511476,
+}
+
+BASE_PRICE = 60
+DB_PATH = "bot.db"
+
+
+# =========================
+# INIT
+# =========================
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher()
+flyer = Flyer(FLYER_KEY)
+
+conn = sqlite3.connect(DB_PATH)
+cursor = conn.cursor()
+
+user_state = {}
+
+
+# =========================
+# DB
+# =========================
+def ensure_tables():
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        referrer_id INTEGER,
+        created_at TEXT
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS admins (
+        user_id INTEGER PRIMARY KEY
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        gift TEXT,
+        gift_id INTEGER,
+        price INTEGER,
+        comment TEXT,
+        anonymous INTEGER,
+        created_at TEXT
+    )
+    """)
+
+    conn.commit()
+
+
+def ensure_column(table_name: str, column_name: str, column_type: str):
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    columns = [row[1] for row in cursor.fetchall()]
+    if column_name not in columns:
+        cursor.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+        )
+        conn.commit()
+
+
+def run_migrations():
+    ensure_tables()
+
+    ensure_column("users", "username", "TEXT")
+    ensure_column("users", "referrer_id", "INTEGER")
+    ensure_column("users", "created_at", "TEXT")
+
+    ensure_column("orders", "gift_id", "INTEGER")
+    ensure_column("orders", "comment", "TEXT")
+    ensure_column("orders", "anonymous", "INTEGER")
+    ensure_column("orders", "created_at", "TEXT")
+
+    cursor.execute(
+        "INSERT OR IGNORE INTO admins (user_id) VALUES (?)",
+        (OWNER_ADMIN_ID,)
+    )
+
+    set_setting_if_missing("markup", "0")
+    set_setting_if_missing("log_chat", "")
+    set_setting_if_missing("flyer_enabled", "1")
+
+    conn.commit()
+
+
+# =========================
+# SETTINGS / HELPERS
+# =========================
+def get_setting(key, default=None):
+    row = cursor.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (key,)
+    ).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key, value):
+    cursor.execute(
+        "REPLACE INTO settings (key, value) VALUES (?, ?)",
+        (key, str(value))
+    )
+    conn.commit()
+
+
+def set_setting_if_missing(key, value):
+    exists = cursor.execute(
+        "SELECT 1 FROM settings WHERE key=?",
+        (key,)
+    ).fetchone()
+    if not exists:
+        set_setting(key, value)
+
+
+def is_admin(user_id: int) -> bool:
+    row = cursor.execute(
+        "SELECT 1 FROM admins WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+    return bool(row)
+
+
+def flyer_enabled() -> bool:
+    return str(get_setting("flyer_enabled", "1")) == "1"
+
+
+def current_markup() -> int:
+    try:
+        return int(get_setting("markup", "0") or 0)
+    except Exception:
+        return 0
+
+
+def current_price() -> int:
+    return BASE_PRICE + current_markup()
+
+
+async def send_log(text: str):
+    log_chat = get_setting("log_chat", "")
+    if not log_chat:
+        return
+    try:
+        await bot.send_message(int(log_chat), text)
+    except Exception as e:
+        logging.warning(f"Не удалось отправить лог: {e}")
+
+
+def get_username_text(user: Message | CallbackQuery) -> str:
+    from_user = user.from_user
+    if from_user.username:
+        return f"@{from_user.username}"
+    return "нет"
+
+
+# =========================
+# FLYER OP (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# =========================
+def flyer_message():
+    return {
+        "rows": 2,
+        "text": (
+            "<b>Чтобы открыть магазин, выполни обязательные действия.</b>\n\n"
+            "После выполнения снова нажми кнопку магазина."
+        ),
+        "button_bot": "Запустить бота",
+        "button_channel": "Подписаться",
+        "button_url": "Перейти",
+        "button_boost": "Голосовать",
+        "button_fp": "Выполнить",
+    }
+
+
+async def ensure_flyer_access(user_id: int, language_code: str | None) -> bool:
+    """Проверяет, выполнил ли пользователь задания Flyer.
+       Возвращает True, если задания выполнены или Flyer выключен.
+       Если задания не выполнены — отправляет сообщение с ними и возвращает False."""
+    if not flyer_enabled():
+        return True
+
+    try:
+        msg = flyer_message()
+        result = await flyer.check(
+            user_id=user_id,
+            language_code=language_code or "ru",
+            message=msg
+        )
+
+        # Универсальная обработка ответа
+        if isinstance(result, dict):
+            ok = result.get("skip", False)
+        elif isinstance(result, bool):
+            ok = result
+        else:
+            ok = True  # fallback (например, если вернулся None)
+
+        if not ok:
+            # Отправляем пользователю окно с заданиями (если библиотека сама не отправила)
+            # Пытаемся вызвать метод send (название может отличаться в зависимости от версии)
+            if hasattr(flyer, "send"):
+                await flyer.send(
+                    user_id=user_id,
+                    language_code=language_code or "ru",
+                    message=msg
+                )
+            elif hasattr(flyer, "ask"):
+                await flyer.ask(
+                    user_id=user_id,
+                    language_code=language_code or "ru",
+                    message=msg
+                )
+            else:
+                # Если нет подходящего метода, просто возвращаем False (пользователь не пройдёт проверку)
+                logging.warning("Flyer: нет метода send/ask, не могу отправить задания")
+        return ok
+
+    except Exception as e:
+        logging.exception("Flyer check error")
+        await send_log(
+            f"⚠️ <b>Ошибка Flyer</b>\n"
+            f"🆔 User: <code>{user_id}</code>\n"
+            f"Ошибка: <code>{e}</code>"
+        )
+        # При ошибке лучше пропустить проверку, чтобы не блокировать пользователей
+        return True
+
+
+# =========================
+# KEYBOARDS
+# =========================
+def main_menu_kb(user_id: int):
+    rows = [
+        [InlineKeyboardButton(text="🛍 Магазин", callback_data="shop")]
+    ]
+    if is_admin(user_id):
+        rows.append(
+            [InlineKeyboardButton(text="👑 Админ панель", callback_data="admin")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def shop_kb():
+    rows = []
+    for gift_name in GIFTS:
+        rows.append([
+            InlineKeyboardButton(
+                text=f"🎁 {gift_name}",
+                callback_data=f"gift:{gift_name}"
+            )
+        ])
+    rows.append([
+        InlineKeyboardButton(
+            text="🎲 Случайный подарок",
+            callback_data="gift:random"
+        )
+    ])
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def mode_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👤 Обычная отправка", callback_data="mode:normal")],
+        [InlineKeyboardButton(text="🎭 Анонимная отправка", callback_data="mode:anon")],
+    ])
+
+
+def comment_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Добавить комментарий", callback_data="comment:yes")],
+        [InlineKeyboardButton(text="🚫 Без комментария", callback_data="comment:no")],
+    ])
+
+
+def admin_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="💰 Баланс бота", callback_data="admin_balance")],
+        [InlineKeyboardButton(text="⚙️ Наценка", callback_data="admin_markup")],
+        [InlineKeyboardButton(text="📢 Лог-чат", callback_data="admin_logs")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
+        [InlineKeyboardButton(text="🛡 Flyer OP", callback_data="admin_flyer")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
+    ])
+
+
+def admin_flyer_kb(enabled: bool):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="✅ Включено" if enabled else "❌ Выключено",
+                callback_data="flyer_on" if not enabled else "flyer_off"
+            )
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin")]
+    ])
+
+
+# =========================
+# USER REGISTRATION
+# =========================
+async def ensure_user_registered(message: Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+
+    args = message.text.split()
+    referrer_id = None
+    if len(args) > 1 and args[1].startswith("ref_"):
+        try:
+            referrer_id = int(args[1].replace("ref_", ""))
+        except Exception:
+            referrer_id = None
+
+    existing = cursor.execute(
+        "SELECT user_id FROM users WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
+
+    now = datetime.now().isoformat()
+
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO users (user_id, username, referrer_id, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, username, referrer_id, now)
+    )
+    conn.commit()
+
+    cursor.execute(
+        """
+        UPDATE users
+        SET username = ?,
+            referrer_id = COALESCE(referrer_id, ?),
+            created_at = COALESCE(created_at, ?)
+        WHERE user_id = ?
+        """,
+        (username, referrer_id, now, user_id)
+    )
+    conn.commit()
+
+    if not existing:
+        await send_log(
+            f"🆕 <b>Новая регистрация</b>\n"
+            f"👤 Username: {('@' + username) if username else 'нет'}\n"
+            f"🆔 ID: <code>{user_id}</code>"
+        )
+
+        if referrer_id and referrer_id != user_id:
+            await send_log(
+                f"👥 <b>Новый приглашённый пользователь</b>\n"
+                f"👤 Username: {('@' + username) if username else 'нет'}\n"
+                f"🆔 ID: <code>{user_id}</code>\n"
+                f"🔗 Пригласил: <code>{referrer_id}</code>"
+            )
+
+
+# =========================
+# START / MENU
+# =========================
+@dp.message(CommandStart())
+async def start(message: Message):
+    await ensure_user_registered(message)
+
+    await message.answer(
+        "Добро пожаловать в магазин подарков.\n\n"
+        "Здесь можно купить подарок за Stars, добавить комментарий и отправить его анонимно.",
+        reply_markup=main_menu_kb(message.from_user.id)
+    )
+
+
+@dp.callback_query(F.data == "back_main")
+async def back_main(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "Главное меню.",
+        reply_markup=main_menu_kb(callback.from_user.id)
+    )
+    await callback.answer()
+
+
+# =========================
+# SHOP
+# =========================
+@dp.callback_query(F.data == "shop")
+async def open_shop(callback: CallbackQuery):
+    ok = await ensure_flyer_access(
+        callback.from_user.id,
+        callback.from_user.language_code
+    )
+    if not ok:
+        await callback.answer("❌ Сначала выполни все задания в появившемся окне!", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        f"🛍 <b>Магазин подарков</b>\n\n"
+        f"Текущая цена каждого подарка: <b>{current_price()} Stars</b>\n"
+        f"Выбери конкретный подарок или случайный вариант.",
+        reply_markup=shop_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("gift:"))
+async def choose_gift(callback: CallbackQuery):
+    ok = await ensure_flyer_access(
+        callback.from_user.id,
+        callback.from_user.language_code
+    )
+    if not ok:
+        await callback.answer("❌ Сначала выполни все задания!", show_alert=True)
+        return
+
+    value = callback.data.split(":", 1)[1]
+
+    if value == "random":
+        gift_name = random.choice(list(GIFTS.keys()))
+        is_random = True
+    else:
+        gift_name = value
+        is_random = False
+
+    user_state[callback.from_user.id] = {
+        "gift_name": gift_name,
+        "gift_id": GIFTS[gift_name],
+        "random": is_random,
+    }
+
+    await callback.message.edit_text(
+        f"🎁 <b>Выбран подарок:</b> {gift_name}\n\n"
+        f"Теперь выбери способ отправки.",
+        reply_markup=mode_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mode:"))
+async def choose_mode(callback: CallbackQuery):
+    state = user_state.get(callback.from_user.id)
+    if not state:
+        await callback.answer("Сначала выбери подарок", show_alert=True)
+        return
+
+    state["anonymous"] = callback.data.split(":", 1)[1] == "anon"
+
+    await callback.message.edit_text(
+        f"Способ отправки: <b>{'🎭 Анонимная' if state['anonymous'] else '👤 Обычная'}</b>\n\n"
+        f"Хочешь добавить комментарий к подарку?",
+        reply_markup=comment_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "comment:yes")
+async def want_comment(callback: CallbackQuery):
+    state = user_state.get(callback.from_user.id)
+    if not state:
+        await callback.answer("Сначала выбери подарок", show_alert=True)
+        return
+
+    state["awaiting_comment"] = True
+    await callback.message.answer("✏️ Пришли текст комментария одним сообщением.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "comment:no")
+async def no_comment(callback: CallbackQuery):
+    state = user_state.get(callback.from_user.id)
+    if not state:
+        await callback.answer("Сначала выбери подарок", show_alert=True)
+        return
+
+    state["comment"] = ""
+    await create_invoice_for_user(callback.from_user.id, callback.from_user.language_code)
+    await callback.answer()
+
+
+async def create_invoice_for_user(user_id: int, language_code: str | None):
+    state = user_state.get(user_id)
+    if not state:
+        return
+
+    ok = await ensure_flyer_access(user_id, language_code)
+    if not ok:
+        await bot.send_message(
+            user_id,
+            "❌ Сначала выполни все задания Flyer, потом повтори покупку."
+        )
+        return
+
+    price = current_price()
+    state["price"] = price
+    state["payload"] = f"gift_buy:{user_id}:{int(datetime.now().timestamp())}"
+
+    prices = [LabeledPrice(label=f"Подарок: {state['gift_name']}", amount=price)]
+
+    await bot.send_invoice(
+        chat_id=user_id,
+        title="Покупка подарка",
+        description=(
+            f"Подарок: {state['gift_name']}\n"
+            f"Комментарий: {'есть' if state.get('comment') else 'нет'}\n"
+            f"Отправка: {'анонимная' if state.get('anonymous') else 'обычная'}"
+        ),
+        payload=state["payload"],
+        provider_token="",
+        currency="XTR",
+        prices=prices
+    )
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await pre_checkout_query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: Message):
+    state = user_state.get(message.from_user.id)
+    if not state:
+        await message.answer("Не удалось найти данные заказа. Попробуй снова.")
+        return
+
+    try:
+        await bot.send_gift(
+            user_id=message.from_user.id,
+            gift_id=state["gift_id"],
+            text=state.get("comment", ""),
+            is_anonymous=state.get("anonymous", False)
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO orders (user_id, gift, gift_id, price, comment, anonymous, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                message.from_user.id,
+                state["gift_name"],
+                state["gift_id"],
+                message.successful_payment.total_amount,
+                state.get("comment", ""),
+                1 if state.get("anonymous", False) else 0,
+                datetime.now().isoformat()
+            )
+        )
+        conn.commit()
+
+        username = message.from_user.username or "нет"
+
+        await send_log(
+            f"💰 <b>Новая покупка</b>\n"
+            f"👤 Username: {('@' + username) if username != 'нет' else 'нет'}\n"
+            f"🆔 ID: <code>{message.from_user.id}</code>\n"
+            f"🎁 Подарок: <b>{state['gift_name']}</b>\n"
+            f"💵 Сумма: <b>{message.successful_payment.total_amount} Stars</b>\n"
+            f"🎭 Анонимно: <b>{'Да' if state.get('anonymous') else 'Нет'}</b>\n"
+            f"💬 Комментарий: <b>{state.get('comment') or 'нет'}</b>"
+        )
+
+        await message.answer("✅ Оплата прошла успешно.\n🎁 Подарок отправлен.")
+    except Exception as e:
+        logging.exception("Gift send error")
+        await send_log(
+            f"❌ <b>Ошибка выдачи подарка</b>\n"
+            f"🆔 Пользователь: <code>{message.from_user.id}</code>\n"
+            f"🎁 Подарок: <b>{state.get('gift_name')}</b>\n"
+            f"Ошибка: <code>{e}</code>"
+        )
+        await message.answer(
+            "❌ Оплата получена, но при отправке подарка возникла ошибка. Администратор увидит это в логах."
+        )
+
+    user_state.pop(message.from_user.id, None)
+
+
+# =========================
+# ADMIN
+# =========================
+@dp.callback_query(F.data == "admin")
+async def admin_panel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    await callback.message.edit_text(
+        "👑 <b>Админ-панель</b>\n\n"
+        "Здесь можно посмотреть статистику, баланс, настроить наценку, лог-чат и Flyer OP.",
+        reply_markup=admin_menu_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    users_count = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    gifts_count = cursor.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    revenue = cursor.execute("SELECT COALESCE(SUM(price), 0) FROM orders").fetchone()[0]
+    refs_count = cursor.execute(
+        "SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL"
+    ).fetchone()[0]
+
+    text = (
+        "📊 <b>Статистика магазина</b>\n\n"
+        f"👥 Пользователей: <b>{users_count}</b>\n"
+        f"👥 Пришло по приглашению: <b>{refs_count}</b>\n"
+        f"🎁 Выдано подарков: <b>{gifts_count}</b>\n"
+        f"💰 Общая выручка: <b>{revenue} Stars</b>\n"
+        f"⚙️ Текущая наценка: <b>{current_markup()} Stars</b>\n"
+        f"🛡 Flyer OP: <b>{'включён' if flyer_enabled() else 'выключен'}</b>\n"
+        f"📢 Лог-чат: <code>{get_setting('log_chat', 'не настроен') or 'не настроен'}</code>"
+    )
+
+    await callback.message.edit_text(text, reply_markup=admin_menu_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_balance")
+async def admin_balance(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    try:
+        balance = await bot.get_my_star_balance()
+        amount = getattr(balance, "amount", balance)
+        text = (
+            "💰 <b>Баланс бота</b>\n\n"
+            f"Сейчас на балансе: <b>{amount} Stars</b>"
+        )
+    except Exception as e:
+        text = (
+            "💰 <b>Баланс бота</b>\n\n"
+            f"Не удалось получить баланс.\n"
+            f"Ошибка: <code>{e}</code>"
+        )
+
+    await callback.message.edit_text(text, reply_markup=admin_menu_kb())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_markup")
+async def admin_markup(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    user_state[callback.from_user.id] = {"admin_action": "set_markup"}
+
+    await callback.message.answer(
+        "⚙️ <b>Настройка наценки</b>\n\n"
+        f"Базовая цена: <b>{BASE_PRICE} Stars</b>\n"
+        f"Текущая наценка: <b>{current_markup()} Stars</b>\n"
+        f"Итоговая цена: <b>{current_price()} Stars</b>\n\n"
+        "Пришли новое число одним сообщением.\n"
+        "Например: <code>10</code>"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_logs")
+async def admin_logs(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    user_state[callback.from_user.id] = {"admin_action": "set_log_chat"}
+
+    await callback.message.answer(
+        "📢 <b>Настройка лог-чата</b>\n\n"
+        f"Текущий лог-чат: <code>{get_setting('log_chat', '') or 'не настроен'}</code>\n\n"
+        "Пришли ID чата для логов.\n"
+        "Пример:\n"
+        "<code>-1001234567890</code>"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    users_count = cursor.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    refs_count = cursor.execute(
+        "SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL"
+    ).fetchone()[0]
+
+    await callback.message.edit_text(
+        "👥 <b>Пользователи</b>\n\n"
+        f"Всего зарегистрировано: <b>{users_count}</b>\n"
+        f"Пришло по приглашению: <b>{refs_count}</b>",
+        reply_markup=admin_menu_kb()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_flyer")
+async def admin_flyer(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    enabled = flyer_enabled()
+
+    await callback.message.edit_text(
+        "🛡 <b>Flyer OP</b>\n\n"
+        f"Текущий статус: <b>{'включён' if enabled else 'выключен'}</b>\n\n"
+        "Когда Flyer включён, пользователь не сможет открыть магазин, "
+        "пока не выполнит обязательные задания.",
+        reply_markup=admin_flyer_kb(enabled)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_({"flyer_on", "flyer_off"}))
+async def toggle_flyer(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+
+    set_setting("flyer_enabled", "1" if callback.data == "flyer_on" else "0")
+    await callback.answer("✅ Настройка сохранена")
+    await admin_flyer(callback)
+
+
+# =========================
+# UNIVERSAL MESSAGE HANDLER
+# =========================
+@dp.message()
+async def universal_message_handler(message: Message):
+    state = user_state.get(message.from_user.id)
+    if not state:
+        return
+
+    admin_action = state.get("admin_action")
+    if admin_action and is_admin(message.from_user.id):
+        if admin_action == "set_markup":
+            try:
+                value = int(message.text.strip())
+                if value < 0:
+                    await message.answer("❌ Наценка не может быть меньше 0.")
+                    return
+
+                set_setting("markup", value)
+                user_state.pop(message.from_user.id, None)
+
+                await message.answer(
+                    "✅ <b>Наценка обновлена</b>\n\n"
+                    f"Новая наценка: <b>{value} Stars</b>\n"
+                    f"Новая цена подарка: <b>{BASE_PRICE + value} Stars</b>",
+                    reply_markup=admin_menu_kb()
+                )
+                return
+            except ValueError:
+                await message.answer("❌ Пришли число. Например: <code>10</code>")
+                return
+
+        if admin_action == "set_log_chat":
+            try:
+                chat_id = int(message.text.strip())
+                set_setting("log_chat", chat_id)
+                user_state.pop(message.from_user.id, None)
+
+                await message.answer(
+                    "✅ <b>Лог-чат обновлён</b>\n\n"
+                    f"Новый чат для логов: <code>{chat_id}</code>",
+                    reply_markup=admin_menu_kb()
+                )
+                return
+            except ValueError:
+                await message.answer("❌ Пришли корректный ID чата числом.")
+                return
+
+    if state.get("awaiting_comment"):
+        state["comment"] = message.text
+        state["awaiting_comment"] = False
+        await create_invoice_for_user(
+            message.from_user.id,
+            message.from_user.language_code
+        )
+        await message.answer(
+            "💳 Инвойс отправлен. Оплати его, и подарок будет выслан автоматически."
+        )
+        return
+
+
+# =========================
+# RUN
+# =========================
+async def main():
+    run_migrations()
+
+    # Проверка Flyer ключа при запуске
+    try:
+        key_data = await flyer.get_key_data()
+        logging.info(f"Flyer API: ключ работает, данные: {key_data}")
+    except Exception as e:
+        logging.warning(f"Flyer API: ошибка проверки ключа - {e}")
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
