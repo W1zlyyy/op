@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import random
 import sqlite3
 from datetime import datetime
@@ -19,10 +20,19 @@ from aiogram.types import (
 
 from flyerapi import Flyer
 
+# =========================
+# CONFIG (чтение из окружения)
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+FLYER_KEY = os.getenv("FLYER_KEY")
+OWNER_ADMIN_ID = os.getenv("OWNER_ADMIN_ID")
 
-# =========================
-# CONFIG
-# =========================
+# Проверка обязательных переменных (выполнится при импорте, до запуска бота)
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не задан в переменных окружения!")
+if not OWNER_ADMIN_ID:
+    raise ValueError("❌ OWNER_ADMIN_ID не задан в переменных окружения!")
+OWNER_ADMIN_ID = int(OWNER_ADMIN_ID)  # преобразуем в число
 
 GIFTS = {
     "новогодний мишка": 5956217000635139069,
@@ -36,7 +46,6 @@ GIFTS = {
 BASE_PRICE = 60
 DB_PATH = "bot.db"
 
-
 # =========================
 # INIT
 # =========================
@@ -47,12 +56,31 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
-flyer = Flyer(FLYER_KEY)
+
+# Если FLYER_KEY не задан, создаём заглушку, чтобы бот не падал
+if FLYER_KEY:
+    flyer = Flyer(FLYER_KEY)
+else:
+    logging.warning("FLYER_KEY не задан, Flyer будет выключен")
+    # Создаём объект-заглушку, который всегда возвращает True при проверке
+    class DummyFlyer:
+        async def check(self, *args, **kwargs):
+            return True
+        async def get_key_data(self):
+            return {}
+        async def send(self, *args, **kwargs):
+            pass
+        async def ask(self, *args, **kwargs):
+            pass
+    flyer = DummyFlyer()
 
 conn = sqlite3.connect(DB_PATH)
 cursor = conn.cursor()
 
 user_state = {}
+
+# Остальной код без изменений (все функции, хендлеры и т.д.)
+# ...
 
 
 # =========================
