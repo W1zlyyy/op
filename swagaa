@@ -23,10 +23,6 @@ from flyerapi import Flyer
 # =========================
 # CONFIG
 # =========================
-BOT_TOKEN = "8611016897:AAFKzH00dhqGzluHWeyj8m8W2RpTRlorDgo"
-FLYER_KEY = ""
-
-OWNER_ADMIN_ID = 1426171031
 
 GIFTS = {
     "новогодний мишка": 5956217000635139069,
